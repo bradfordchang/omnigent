@@ -1683,6 +1683,18 @@
             "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/Users/corey/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead.",
             "title": "Workspace",
             "type": "string"
+          },
+          "workspace_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Branch of a pre-existing worktree the runner is bound to (`workspace` is that worktree). No worktree is created; the branch is persisted as the session's `git_branch` for display and opt-in cleanup. Mutually exclusive with `git`.",
+            "title": "Workspace Branch"
           }
         },
         "required": [

@@ -1054,7 +1054,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
 
-  it("lists existing worktrees and starts directly in a selected one (no git opts)", async () => {
+  it("lists existing worktrees and starts directly in a selected one (workspace_branch, no git opts)", async () => {
     // The seeded repo has one linked worktree; the main tree is filtered out.
     useHostWorktreesMock.mockReturnValue({
       data: [
@@ -1106,9 +1106,12 @@ describe("NewChatLandingScreen", () => {
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
     // Workspace is bound straight to the worktree dir; NO git opts are sent
-    // (starting in an existing worktree creates nothing).
+    // (starting in an existing worktree creates nothing). The worktree's
+    // branch rides along as `workspace_branch` so the sidebar shows it and
+    // the delete flow can offer to remove it.
     expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
     expect(body.git).toBeUndefined();
+    expect(body.workspace_branch).toBe("feature/x");
   });
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
@@ -1155,9 +1158,12 @@ describe("NewChatLandingScreen", () => {
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as {
       git?: { branch_name: string };
+      workspace_branch?: string;
     };
-    // A new worktree for the edited branch name is requested.
+    // A new worktree for the edited branch name is requested — this is a
+    // create, not a bind to an existing worktree, so no `workspace_branch`.
     expect(body.git?.branch_name).toBe("feature/y");
+    expect(body.workspace_branch).toBeUndefined();
   });
 
   it("filters the worktree dropdown as you type in the branch combobox", async () => {

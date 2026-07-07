@@ -256,5 +256,68 @@ async def test_create_with_invalid_base_branch_fails_400(
     assert body["error"]["code"] == "invalid_input"
     # The host's reason is surfaced verbatim so the UI can show it.
     assert "base branch does not exist" in body["error"]["message"]
+
+
+async def test_create_with_workspace_branch_persists_without_creating(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """Starting in an existing worktree persists its branch, creates nothing.
+
+    ``workspace_branch`` binds the session straight to a pre-existing
+    worktree directory: no create-worktree frame is sent to the host,
+    and the supplied branch is persisted as ``git_branch`` so the
+    sidebar shows it and the opt-in delete flow can offer to remove it.
+    """
+    captured = register_worktree_host()
+    agent = await create_test_agent(client, name="wt-existing-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "workspace_branch": "feature/existing",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    # No worktree was created — the host received no create frame.
+    assert len(captured) == 0, f"expected no create_worktree frame, got {len(captured)}"
+
+    # The existing worktree's branch is persisted; the workspace is the
+    # supplied directory verbatim (no worktree-path rewrite).
+    body = resp.json()
+    assert body["git_branch"] == "feature/existing"
+    assert body["workspace"] == _SOURCE_REPO
+
+
+async def test_create_with_invalid_workspace_branch_fails_400(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """An invalid ``workspace_branch`` name fails the create with 400.
+
+    The host never runs git for this path, so the server is the only
+    gate on the name; a malformed branch is user-correctable input and
+    maps to INVALID_INPUT (400), not 500.
+    """
+    register_worktree_host()
+    agent = await create_test_agent(client, name="wt-existing-bad-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "workspace_branch": "bad..branch",
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
     # The failed create returned an error, not a session.
     assert "id" not in body

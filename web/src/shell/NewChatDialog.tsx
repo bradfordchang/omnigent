@@ -2560,7 +2560,10 @@ export function NewChatLandingScreen() {
           const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
             : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+          // Starting in an existing worktree: bind its branch for the sidebar
+          // + delete flow without creating a worktree.
+          const workspaceBranch = startInExistingWorktree ? trimmedBranch : undefined;
+          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts, workspaceBranch);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);
@@ -2582,6 +2585,9 @@ export function NewChatLandingScreen() {
                   git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : undefined,
+                  // Starting in an existing worktree: record its branch so the
+                  // sidebar shows it and the delete flow can offer to remove it.
+                  workspace_branch: startInExistingWorktree ? trimmedBranch : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and

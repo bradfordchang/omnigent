@@ -610,6 +610,56 @@ def test_session_create_git_with_host_id_ok() -> None:
     assert req.git.branch_name == "feature/x"
 
 
+def test_session_create_workspace_branch_requires_host_id() -> None:
+    """``workspace_branch`` without ``host_id`` is rejected (422).
+
+    The branch is persisted as the session's ``git_branch``, which is
+    only meaningful for a host-bound session. Failing in the model
+    keeps the error at the boundary instead of deeper in the flow.
+    """
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="workspace_branch requires host_id"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            workspace="/repo/worktrees/feature-x",
+            workspace_branch="feature/x",
+        )
+
+
+def test_session_create_workspace_branch_rejects_git() -> None:
+    """``workspace_branch`` + ``git`` is contradictory and rejected (422).
+
+    ``git`` *creates* a worktree and sets its own branch;
+    ``workspace_branch`` records an *existing* worktree's branch
+    without creating one. Both at once is a caller bug.
+    """
+    from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
+
+    with pytest.raises(ValidationError, match="workspace_branch cannot be combined with git"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_id="host_abc",
+            workspace="/repo/worktrees/feature-x",
+            git=SessionGitOptions(branch_name="feature/x"),
+            workspace_branch="feature/x",
+        )
+
+
+def test_session_create_workspace_branch_with_host_id_ok() -> None:
+    """``workspace_branch`` with ``host_id`` and no ``git`` validates cleanly."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    req = SessionCreateRequest(
+        agent_id="ag_x",
+        host_id="host_abc",
+        workspace="/repo/worktrees/feature-x",
+        workspace_branch="feature/x",
+    )
+    assert req.workspace_branch == "feature/x"
+    assert req.git is None
+
+
 def test_session_create_host_type_defaults_external() -> None:
     """
     ``host_type`` defaults to ``"external"`` — the pre-existing

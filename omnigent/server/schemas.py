@@ -1233,6 +1233,7 @@ class SessionCreateRequest(BaseModel):
     host_id: str | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
+    workspace_branch: str | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
@@ -1254,6 +1255,29 @@ class SessionCreateRequest(BaseModel):
         """
         if self.git is not None and self.host_id is None:
             raise ValueError("git worktree creation requires host_id")
+        return self
+
+    @model_validator(mode="after")
+    def _check_workspace_branch(self) -> SessionCreateRequest:
+        """
+        Validate ``workspace_branch`` and its exclusivity with ``git``.
+
+        ``workspace_branch`` records the branch of a pre-existing
+        worktree the caller started the session in (no worktree is
+        created), so it is persisted as the session's ``git_branch``
+        for display and opt-in cleanup. It is meaningless without a
+        host, and mutually exclusive with ``git`` (which *creates* a
+        worktree and sets its own branch). Failing here returns 422.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``workspace_branch`` is combined with
+            ``git``, or set without ``host_id``.
+        """
+        if self.workspace_branch is not None:
+            if self.git is not None:
+                raise ValueError("workspace_branch cannot be combined with git")
+            if self.host_id is None:
+                raise ValueError("workspace_branch requires host_id")
         return self
 
     @model_validator(mode="after")

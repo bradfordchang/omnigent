@@ -22,7 +22,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
@@ -221,11 +221,32 @@ class LaunchRunnerRequest(BaseModel):
         ``POST /v1/sessions``). ``None`` binds ``workspace`` directly.
         ``host_id`` is always present (it is in the path), so no
         host requirement check is needed here.
+    :param workspace_branch: Branch of a pre-existing worktree the
+        runner is bound to (``workspace`` is that worktree). No
+        worktree is created; the branch is persisted as the session's
+        ``git_branch`` for display and opt-in cleanup. Mutually
+        exclusive with ``git``.
     """
 
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+    workspace_branch: str | None = None
+
+    @model_validator(mode="after")
+    def _check_workspace_branch(self) -> LaunchRunnerRequest:
+        """Reject ``workspace_branch`` combined with ``git`` (422).
+
+        ``git`` creates a worktree and sets its own branch;
+        ``workspace_branch`` records an existing worktree's branch
+        without creating one. Both at once is contradictory.
+
+        :returns: The validated instance.
+        :raises ValueError: If both are set.
+        """
+        if self.workspace_branch is not None and self.git is not None:
+            raise ValueError("workspace_branch cannot be combined with git")
+        return self
 
 
 async def _resolve_agent_spec_cwd(
@@ -516,6 +537,21 @@ def create_hosts_router(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             workspace = worktree.worktree_path
             git_branch = worktree.branch
+        elif body.workspace_branch is not None:
+            # Binding to a pre-existing worktree: no worktree is created, but
+            # record its branch so the sidebar shows it and the opt-in delete
+            # flow can offer to remove it. The host never runs git for this
+            # path, so the server validates the name.
+            from omnigent.host.git_worktree import (
+                WorktreeError,
+                validate_branch_name,
+            )
+
+            try:
+                validate_branch_name(body.workspace_branch)
+            except WorktreeError as exc:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+            git_branch = body.workspace_branch
 
         async def _rollback_worktree() -> None:
             """
