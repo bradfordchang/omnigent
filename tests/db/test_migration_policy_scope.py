@@ -48,16 +48,18 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
+                # kind/type run at head, where they are int codes
+                # (1 = "default"/"python" per enum_codecs).
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind)"
-                " VALUES ('conv_sc1', 1, 1, 'conv_sc1', 'default')"
+                " VALUES ('conv_sc1', 1, 1, 'conv_sc1', 1)"
             )
         )
         conn.execute(
             sa.text(
                 "INSERT INTO policies"
                 " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_sc1', 'sess_pol', 'conv_sc1', 'session', 1, 'python', 'mod.f', 1)"
+                " VALUES ('pol_sc1', 'sess_pol', 'conv_sc1', 'session', 1, 1, 'mod.f', 1)"
             )
         )
         scope = conn.execute(
@@ -73,7 +75,7 @@ def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> 
             sa.text(
                 "INSERT INTO policies"
                 " (id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_def1', 'def_pol', NULL, 'default', 1, 'python', 'mod.f', 1)"
+                " VALUES ('pol_def1', 'def_pol', NULL, 'default', 1, 1, 'mod.f', 1)"
             )
         )
         scope = conn.execute(
@@ -147,10 +149,11 @@ def test_downgrade_removes_scope_column(tmp_path: Path) -> None:
     uri = f"sqlite:///{db_path}"
     engine = get_or_create_engine(uri)
 
-    # Start at head (includes q1a2b3c4d5e6).
+    # Start at head (includes the scope migration q1a2b3c4d5e6).
     assert "scope" in {c["name"] for c in sa.inspect(engine).get_columns("policies")}
 
-    # Downgrade one step.
+    # Downgrade below the scope migration (through the later enums→SMALLINT
+    # migration that now sits above it).
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
         config.attributes["connection"] = conn

@@ -108,7 +108,7 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
             sa.text(
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 'default', :agent_id)"
+                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
             ),
             {"id": "conv_bound", "ts": 1700000002, "agent_id": "ag_bound"},
         )
@@ -130,7 +130,7 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
             sa.text(
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 'default', :agent_id)"
+                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
             ),
             {"id": "conv_missing", "ts": 1700000002, "agent_id": "ag_nonexistent"},
         )
@@ -218,6 +218,8 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
         )
         conn.execute(
             sa.text(
+                # Seeded at n1 and upgraded only to o1 — both precede the enum→
+                # SMALLINT migration (q1), so conversations.kind is still a string.
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
                 " VALUES ('conv_1', 3, 3, 'conv_1', 'default', 'ag_sess')"
@@ -252,6 +254,8 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
     engine = get_or_create_engine(uri)
 
     # Seed data on the upgraded schema: one template, one session-scoped agent.
+    # This runs against the full chain (head), where conversations.kind is the
+    # int code (1 = "default"); agents.kind is still a string enum.
     with engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -264,7 +268,7 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES ('conv_1', 3, 3, 'conv_1', 'default', 'ag_sess')"
+                " VALUES ('conv_1', 3, 3, 'conv_1', 1, 'ag_sess')"
             )
         )
 
