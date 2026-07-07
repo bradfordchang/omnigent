@@ -1739,9 +1739,11 @@ def test_start_session_select_existing_worktree(seeded_session: tuple[str, str])
 
     The branch chip's input doubles as a combobox: focusing it lists the
     repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
-    one must (a) point the workspace at that worktree's directory and
+    one must (a) point the workspace at that worktree's directory,
     (b) send NO ``git`` spec on ``POST /v1/sessions`` — the session starts
-    directly in the existing worktree rather than creating a new one.
+    directly in the existing worktree rather than creating a new one — and
+    (c) send the worktree's branch as ``workspace_branch`` so the sidebar
+    shows it and the delete flow can offer to remove it.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
@@ -1822,9 +1824,12 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             # Workspace is the worktree dir; NO git spec is sent (starting in an
-            # existing worktree creates nothing).
+            # existing worktree creates nothing). The worktree's branch rides
+            # along as workspace_branch so the sidebar shows it and the delete
+            # flow can offer to remove it.
             assert body["workspace"] == "/work/repo-worktrees/feature-x", body
             assert body.get("git") is None, body
+            assert body["workspace_branch"] == "feature/x", body
         finally:
             await browser.close()
 
