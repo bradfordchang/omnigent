@@ -428,6 +428,40 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("paints history before the session snapshot resolves", async () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ];
+    seedSession("conv_slow_snap", items);
+    let releaseSnapshot: (() => void) | null = null;
+    const snapshotReady = new Promise<void>((resolve) => {
+      releaseSnapshot = () => resolve();
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_slow_snap" && (init?.method ?? "GET") === "GET") {
+        return snapshotReady.then(() => defaultFetchHandler(input, init));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switchPromise = useChatStore.getState().switchTo("conv_slow_snap");
+    await tick();
+    const mid = useChatStore.getState();
+    expect(mid.loadingConversation).toBe(false);
+    expect(mid.blocks).toHaveLength(2);
+    expect(mid.boundAgentId).toBeNull();
+
+    releaseSnapshot!();
+    await switchPromise;
+
+    const final = useChatStore.getState();
+    expect(final.boundAgentId).toBe("agent_xyz");
+    expect(final.blocks).toHaveLength(2);
+  });
+
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
     // The core fix: a native web message that hasn't round-tripped
     // through the transcript yet is replayed by the server in

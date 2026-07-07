@@ -7,6 +7,7 @@
 // useful client-side error trail.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
 import {
   approve,
   bindOnlyOnlineRunner,
@@ -16,10 +17,12 @@ import {
   forkSession,
   getSession,
   getSessionSlim,
+  initialHistoryQueryKey,
   interrupt,
   listRunners,
   openSessionStream,
   postEvent,
+  prefetchSessionForSwitch,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -1036,5 +1039,22 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("prefetchSessionForSwitch", () => {
+  it("prefetches the session snapshot and initial history window", () => {
+    const queryClient = new QueryClient();
+    const prefetchSpy = vi.spyOn(queryClient, "prefetchQuery");
+
+    prefetchSessionForSwitch(queryClient, "conv_prefetch");
+
+    expect(prefetchSpy).toHaveBeenCalledTimes(2);
+    expect(prefetchSpy.mock.calls[0]![0]).toMatchObject({
+      queryKey: ["session", "conv_prefetch"],
+    });
+    expect(prefetchSpy.mock.calls[1]![0]).toMatchObject({
+      queryKey: initialHistoryQueryKey("conv_prefetch"),
+    });
   });
 });

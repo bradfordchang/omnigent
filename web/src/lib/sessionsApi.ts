@@ -10,6 +10,7 @@
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
+import type { QueryClient } from "@tanstack/react-query";
 import type { ConversationItem } from "./conversationItems";
 import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
@@ -988,4 +989,32 @@ export async function approve(
   return postEventResponseFromWire(
     await readJsonOrThrow<{ queued: boolean; item_id?: string }>(res),
   );
+}
+
+/** React Query key for the initial history window prefetched on sidebar hover. */
+export function initialHistoryQueryKey(sessionId: string): readonly [string, string, string] {
+  return ["session", sessionId, "initialHistory"];
+}
+
+/**
+ * Warm the session snapshot and initial history cache before a sidebar click.
+ * TanStack dedupes in-flight prefetches with `bindStream`'s fetches.
+ */
+export function prefetchSessionForSwitch(queryClient: QueryClient, sessionId: string): void {
+  const snapshotState = queryClient.getQueryState(["session", sessionId]);
+  if (snapshotState?.fetchStatus !== "fetching") {
+    void queryClient.prefetchQuery({
+      queryKey: ["session", sessionId],
+      queryFn: () => getSessionSlim(sessionId, { refreshState: true }),
+      staleTime: 30_000,
+    });
+  }
+  const historyState = queryClient.getQueryState(initialHistoryQueryKey(sessionId));
+  if (historyState?.fetchStatus !== "fetching") {
+    void queryClient.prefetchQuery({
+      queryKey: initialHistoryQueryKey(sessionId),
+      queryFn: () => fetchInitialHistoryWindow(sessionId),
+      staleTime: 60_000,
+    });
+  }
 }
