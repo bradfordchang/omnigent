@@ -1646,7 +1646,7 @@ function MainAgentSurface({
                 </ConversationEmptyState>
               )
             ) : (
-              <>
+              <div data-testid="chat-transcript-ready">
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} />
                 ))}
@@ -1685,7 +1685,7 @@ function MainAgentSurface({
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-              </>
+              </div>
             )}
           </ConversationContent>
           <ConversationScrollButton />
@@ -1766,7 +1766,10 @@ function MainAgentSurface({
 
 function HydratingPlaceholder() {
   return (
-    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm">
+    <div
+      data-testid="hydrating-placeholder"
+      className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm"
+    >
       <Loader2Icon className="size-4 animate-spin" />
       Loading conversation…
     </div>
