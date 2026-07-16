@@ -89,6 +89,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -321,6 +322,16 @@ def build_native_claude_terminal_env(
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+    # On the apiKeyHelper path the credential reaches Claude Code via the
+    # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
+    # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
+    if claude_config is not None and claude_config.api_key_helper:
+        if _ANTHROPIC_API_KEY_ENV in terminal_env:
+            raise RuntimeError(
+                "native-claude: apiKeyHelper is configured but the terminal env "
+                f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                "Claude Code via the helper, not the environment."
+            )
     return terminal_env
 
 
@@ -1785,20 +1796,10 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped Claude Code (the
         # relay's gate is a non-empty ``terminals:`` block on this
-        # spec). Caller process / no sandbox matches the ``os_env``
-        # stance above — the native CLI already runs unsandboxed on
-        # the user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # spec). Its command follows the user's ``$SHELL`` (zsh/fish/bash);
+        # caller process / no sandbox matches the ``os_env`` stance above —
+        # the native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
@@ -3670,17 +3671,25 @@ def _claude_transcript_record_from_session_item(
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
         record_type = "user"
+        # Image (and other structured) tool results are persisted as a
+        # stringified content-block array. Rehydrate them into real blocks
+        # so ``claude --resume`` sends screenshots as images — not as ~250K
+        # tokens of base64 text — and the model actually sees them again.
+        content_blocks = _claude_tool_result_content_blocks(output)
+        content: str | list[dict[str, Any]] = (
+            content_blocks if content_blocks is not None else output
+        )
         message = {
             "role": "user",
             "content": [
                 {
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": output,
+                    "content": content,
                 }
             ],
         }
-        extra["toolUseResult"] = output
+        extra["toolUseResult"] = _json_safe_tool_use_result(output)
     else:
         return None
     return {
@@ -3798,6 +3807,72 @@ def _json_object_from_string(value: object) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_safe_tool_use_result(output: str) -> str:
+    """
+    Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
+
+    Some built-in result renderers (notably ``TaskOutput``) call
+    ``JSON.parse`` on ``toolUseResult`` when the transcript is resumed.
+    A raw display string such as ``"<retrieval_status>timeout</...>"``
+    throws ``JSON Parse error: Unrecognized token '<'`` at TUI boot,
+    before the input prompt renders — so the whole resume fails and the
+    first web-UI message is never delivered.
+
+    Outputs that are already JSON (e.g. an image content-block array)
+    pass through verbatim; anything else is wrapped as a JSON string
+    literal so the parse always succeeds. The plain-text output still
+    lives verbatim in the ``tool_result`` content block, so this does
+    not change what the model or the web UI sees.
+
+    :param output: The tool result string synthesized for the
+        transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
+        ``'[{"type":"image",...}]'``.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return json.dumps(output)
+    return output
+
+
+def _claude_tool_result_content_blocks(output: str) -> list[dict[str, Any]] | None:
+    """
+    Rehydrate a stringified content-block array into real blocks.
+
+    Tool results that return image content are persisted as a JSON *string*
+    like ``'[{"type":"image","source":{...}}]'``. Passing that string
+    straight into a ``tool_result`` content block makes ``claude --resume``
+    send the base64 to the API as plain text — a single screenshot balloons
+    to ~250K text tokens instead of the ~1.5K an image block costs, which is
+    what pushes a resumed conversation over the context limit.
+
+    Only ``text`` and ``image`` blocks are rehydrated: those are the block
+    types the API accepts inside a ``tool_result``. Anything else (plain
+    text, or a JSON array of some other shape) stays a raw string so the
+    resume request keeps sending exactly what it did before.
+
+    :param output: The persisted tool-result string, e.g.
+        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
+        or plain text like ``"file written"``.
+    :returns: A list of content blocks when *output* parses to a non-empty
+        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
+        caller keeps the raw string as the block content.
+    """
+    try:
+        parsed = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    if not all(
+        isinstance(block, dict) and block.get("type") in ("text", "image") for block in parsed
+    ):
+        return None
+    return parsed
 
 
 def _preflight_local_tools(command: str) -> None:

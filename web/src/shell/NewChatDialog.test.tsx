@@ -33,6 +33,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -43,7 +44,10 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -65,6 +69,9 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
+  // "No newest session" keeps the project prefill inert so the generic
+  // host/workspace defaults under test still apply on ?project= visits.
+  useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -72,7 +79,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
-    "openai-agents": "OpenAI Agents SDK",
     codex: "Codex",
     cursor: "Cursor",
     pi: "Pi",
@@ -628,11 +634,14 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   });
   const info: ServerInfo = {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     ...infoOverrides,
@@ -806,6 +815,93 @@ describe("NewChatLandingScreen", () => {
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // The default agents are claude-native (a1) and codex-native (a2); the host
+  // below reports codex-native as unconfigured on this machine.
+  function mockHostWithHarnessReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      } as Host,
+    ]);
+  }
+
+  it("shows unconfigured harnesses by default (opt-in preference off)", () => {
+    // With the preference untouched the picker keeps listing harnesses that
+    // aren't set up on the host — they're badged, not hidden — so users can
+    // still discover and configure them.
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
+  });
+
+  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
+    // Preference on → codex-native (reported unconfigured on host_1) drops out
+    // of the picker while claude-native (configured) stays.
+    writeHideUnconfiguredHarnesses(true);
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+  });
+
+  // Polly is a bundle agent whose brain harness (claude-sdk) is overridable, so
+  // its config submenu lists every brain harness — each badged when unconfigured.
+  function mockPollyWithBrainReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-sdk": true,
+          codex: "binary-missing",
+          cursor: false,
+          pi: false,
+          antigravity: true,
+          copilot: false,
+        },
+      } as Host,
+    ]);
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("lists every brain harness in a bundle agent's override submenu by default", () => {
+    // Preference off → the brain override still offers unconfigured harnesses
+    // (badged), so they remain discoverable.
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-cursor")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-copilot")).toBeTruthy();
+  });
+
+  it("hides unconfigured brain harnesses in the override submenu when the preference is on", () => {
+    // Preference on → only brains that can launch on the host remain, plus the
+    // selected default (claude-sdk) which always stays for radio coherence.
+    writeHideUnconfiguredHarnesses(true);
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-antigravity")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-harness-codex")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-cursor")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-pi")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
@@ -1055,7 +1151,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
 
-  it("lists existing worktrees and starts directly in a selected one (no git opts)", async () => {
+  it("lists existing worktrees and starts directly in a selected one (git bind mode)", async () => {
     // The seeded repo has one linked worktree; the main tree is filtered out.
     useHostWorktreesMock.mockReturnValue({
       data: [
@@ -1105,11 +1201,18 @@ describe("NewChatLandingScreen", () => {
 
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    // Workspace is bound straight to the worktree dir; NO git opts are sent
-    // (starting in an existing worktree creates nothing).
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      workspace?: string;
+      git?: { branch_name: string; existing_worktree?: boolean; base_branch?: string };
+    };
+    // Workspace is bound straight to the worktree dir. The git block is in
+    // bind mode (`existing_worktree`): no worktree is created, but the
+    // worktree's branch rides along as `branch_name` so the sidebar shows it
+    // and the delete flow can offer to remove it. No base_branch on a bind.
     expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
-    expect(body.git).toBeUndefined();
+    expect(body.git?.existing_worktree).toBe(true);
+    expect(body.git?.branch_name).toBe("feature/x");
+    expect(body.git?.base_branch).toBeUndefined();
   });
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
@@ -1155,10 +1258,12 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     const [, init] = authenticatedFetchMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string) as {
-      git?: { branch_name: string };
+      git?: { branch_name: string; existing_worktree?: boolean };
     };
-    // A new worktree for the edited branch name is requested.
+    // A new worktree for the edited branch name is requested — this is a
+    // create, not a bind, so `existing_worktree` is not set.
     expect(body.git?.branch_name).toBe("feature/y");
+    expect(body.git?.existing_worktree).toBeUndefined();
   });
 
   it("filters the worktree dropdown as you type in the branch combobox", async () => {

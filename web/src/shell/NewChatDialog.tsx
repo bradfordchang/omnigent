@@ -59,10 +59,23 @@ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  initialPrefillState,
+  prefillDone,
+  projectPrefillStep,
+  type ProjectPrefillState,
+} from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -82,7 +95,11 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -92,7 +109,7 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -828,6 +845,9 @@ function LandingProjectPicker({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => {
+                  // Don't commit while an IME composition Enter is being
+                  // confirmed (e.g. Japanese conversion). Mirrors #132/#243.
+                  if (isImeCompositionKeyEvent(e)) return;
                   if (e.key === "Enter") {
                     e.preventDefault();
                     commitNew();
@@ -1112,19 +1132,27 @@ function BrainHarnessOptions({
   onValueChange,
   host,
   labels,
+  hideUnconfigured,
 }: {
   value: string;
   onValueChange: (harness: string) => void;
   host: Host | undefined | null;
   labels: Record<string, string>;
+  hideUnconfigured: boolean;
 }) {
+  // With "hide unconfigured harnesses" on, drop brain options that can't launch
+  // on the host — except the current selection, which stays so the radio group
+  // still reflects the active pick.
+  const entries = Object.entries(labels).filter(
+    ([id]) => id === value || !hideUnconfigured || !harnessUnconfiguredOnHost(id, host),
+  );
   return (
     <>
       <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
-        {Object.entries(labels).map(([id, label]) => (
+        {entries.map(([id, label]) => (
           <DropdownMenuRadioItem
             key={id}
             value={id}
@@ -1318,6 +1346,7 @@ function AgentHarnessPicker({
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
 
   // Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
   // that opens on hover) is unreachable there. On mobile we instead swap the
@@ -1512,6 +1541,7 @@ function AgentHarnessPicker({
           }}
           host={host}
           labels={brainHarnessLabels}
+          hideUnconfigured={hideUnconfigured}
         />
       );
     }
@@ -1589,6 +1619,19 @@ function AgentHarnessPicker({
     );
   };
 
+  // Opt-in "hide unconfigured harnesses" filter (Settings › Appearance). When
+  // on, drop harness rows that can't launch on the selected host. Fails open:
+  // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
+  // nothing is hidden in those cases, and unrecognized harnesses stay visible.
+  const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
+  const visibleHarnessEntries = useMemo(
+    () =>
+      hideUnconfigured
+        ? harnessEntries.filter((a) => !harnessUnconfiguredOnHost(a.harness, host))
+        : harnessEntries,
+    [hideUnconfigured, harnessEntries, host],
+  );
+
   return (
     <DropdownMenu
       open={open}
@@ -1604,6 +1647,11 @@ function AgentHarnessPicker({
               top: cssLengthToPx("var(--omnigent-inset-top)"),
               bottom: cssLengthToPx("var(--omnigent-inset-bottom)"),
             });
+          }
+          // Prefetch harness/description/skills for all session-discovered
+          // agents so hasKnobs is stable before the user reads the list.
+          for (const agent of [...harnessEntries, ...agentEntries]) {
+            void prefetchAvailableAgentDetails(agent, queryClient);
           }
         } else {
           // Closing resets the in-place page so the menu always reopens on the
@@ -1669,10 +1717,10 @@ function AgentHarnessPicker({
           <>
             {/* Harnesses group first — the native terminal CLIs (Claude Code is
             the default), so the most-used picks lead. */}
-            {harnessEntries.length > 0 && (
+            {visibleHarnessEntries.length > 0 && (
               <>
                 <PickerSectionHeader>Harnesses</PickerSectionHeader>
-                {harnessEntries.map(renderEntry)}
+                {visibleHarnessEntries.map(renderEntry)}
                 <DropdownMenuSeparator />
               </>
             )}
@@ -1723,7 +1771,6 @@ type LandingDraft = {
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
-  baseBranch: string;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -1751,10 +1798,7 @@ export function NewChatLandingScreen() {
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   const brainHarnessLabels = useBrainHarnessLabels();
-  const { data: hosts } = useHosts();
-  // Sessions the caller can access, to warn when a new session would share a
-  // working directory with a live one (see the conflict tooltip below).
-  const { data: directorySessions } = useDirectorySessions(true);
+  const { data: hosts, isLoading: hostsLoading } = useHosts();
 
   const agentList = useMemo(
     () =>
@@ -1857,15 +1901,23 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
-  // effectiveAgentId below (a stale id falls back to the default).
+  // effectiveAgentId below (a stale id falls back to the default). A
+  // project-driven visit defers to the project-prefill effect instead
+  // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? readLastAgentId(),
+    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => landingDraft?.selectedHostId ?? null,
   );
+  // Sessions on the selected host — fetched only when a host is selected,
+  // to avoid registering hundreds of sessions into the health poll at idle.
+  const { data: directorySessions } = useDirectorySessions(selectedHostId !== null);
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
@@ -1891,7 +1943,17 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
+  // The base branch auto-fills from the configured default (Settings › Git)
+  // when the user names a worktree branch, and is left alone once the user
+  // touches it — clearing the branch name re-arms the auto-fill (see the effect
+  // below). `baseBranchEdited` tracks that hand-off; any edit (including
+  // clearing the field) sets it so a later re-seed won't clobber the choice.
+  const [baseBranch, _setBaseBranch] = useState<string>("");
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(false);
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
@@ -1901,9 +1963,8 @@ export function NewChatLandingScreen() {
   );
   // Project to file the new session under (an implicit collection stored as a
   // conversation_labels row). Empty = unfiled. Applied right after create.
-  // Pre-filled from a `?project=` query param so the sidebar's per-project
-  // "new session" pencil can land here with the project already selected.
-  const projectParam = searchParams.get("project") ?? "";
+  // Pre-filled from the `?project=` param so the sidebar's per-project
+  // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
@@ -1993,7 +2054,6 @@ export function NewChatLandingScreen() {
     sandboxRepoBranch,
     workspace,
     branchName,
-    baseBranch,
     prefilledBranch,
     permissionMode,
     approvalMode,
@@ -2043,21 +2103,116 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
-  // a session can be started without an explicit pick: the sandbox when
-  // the server supports it (it's pinned first in the picker), else the
-  // first online host. Only fills an empty slot; explicit choices are
-  // never overridden.
+  // Project prefill: a project-driven visit reuses the project's newest
+  // session — its host, source repo, and agent — so the composer is ready
+  // to send without re-picking anything.
+  const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
+    projectParam !== "" ? projectParam : null,
+  );
+  // That session may have run in a linked worktree (git_branch set), where
+  // its workspace is the worktree dir, not the repo. Listing that path's
+  // worktrees returns the whole set, including the `is_main` source repo.
+  const needsSourceRepoResolve =
+    projectNewest != null &&
+    projectNewest.git_branch != null &&
+    projectNewest.workspace != null &&
+    projectNewest.host_id != null;
+  const {
+    data: sourceWorktreesData,
+    isError: projectSourceWorktreesFailed,
+    isPlaceholderData: sourceWorktreesArePlaceholder,
+  } = useHostWorktrees(
+    needsSourceRepoResolve ? (projectNewest.host_id ?? null) : null,
+    needsSourceRepoResolve ? (projectNewest.workspace ?? null) : null,
+  );
+  // The hook serves the previous query's data as a placeholder while a new
+  // fetch is in flight — that would be another repo's worktrees here.
+  const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
+  // State machine driving the project prefill: a location track (host →
+  // workspace → branch → settled) plus an independent agent seed. The
+  // generic host/workspace defaults below hold off until the location
+  // track settles so they can't win the race against the project's values.
+  const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
+    initialPrefillState(projectParam),
+  );
+  // The generic defaults gate on the location track only — the agent seed
+  // waits on its own fetch and must not hold up the host/workspace fill.
+  const prefillSettled = prefill.phase === "settled";
+  // Host whose workspace was already seeded once, so a host re-pick doesn't
+  // clobber the field (used by the per-host seeding effect below).
+  const seededHostRef = useRef<string | null>(null);
+
+  // The landing screen stays mounted while `?project=` changes (clicking
+  // another project's pencil), so re-create a fresh visit by hand: clear
+  // every seedable slot and restart the machine. Values the user set are
+  // reset too — a pencil click means "set me up for this project".
   useEffect(() => {
+    if (prefill.project === projectParam) return;
+    setSandboxSelected(false);
+    setSelectedHostId(null);
+    setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    setWorkspace("");
+    setBranchName("");
+    seededHostRef.current = null;
+    setPrefill(initialPrefillState(projectParam));
+  }, [projectParam, prefill.project]);
+
+  // Auto-select an option so a session can be started without an explicit
+  // pick. Prefer the user's last explicit choice (persisted across visits);
+  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
+  // sandbox when the server supports it (it's pinned first in the picker),
+  // else the first online host. Only fills an empty slot; an explicit choice
+  // already in state (or restored from the in-memory draft) is never
+  // overridden. Holds off while a project prefill is deciding.
+  useEffect(() => {
+    if (!prefillSettled) return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+
+    // Read the persisted pick once, as a mount-time seed — deliberately NOT a
+    // dependency: it only matters until the slot is filled, and re-running on
+    // its value would fight an explicit in-session selection.
+    const lastChoice = readLastHostChoice();
+    if (lastChoice === SANDBOX_HOST_CHOICE) {
+      // Wait for the server-info probe before acting on a sandbox pick: until
+      // it resolves we don't know whether the sandbox is offered, and falling
+      // through to a connected host would strand the returning sandbox user
+      // (this effect wouldn't re-run to correct it once a host is set).
+      if (info === "loading") return;
+      if (managedSandboxesEnabled) {
+        setSandboxSelected(true);
+        return;
+      }
+      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+    } else if (lastChoice) {
+      // A persisted host pick can only be honored once the host list has
+      // loaded and shows it online. Wait for the load rather than defaulting
+      // past it — defaulting to the sandbox here would set sandboxSelected and
+      // this effect would then never re-run to restore the host.
+      if (hostsLoading) return;
+      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice && h.status === "online");
+      if (stored) {
+        setSelectedHostId(stored.host_id);
+        return;
+      }
+      // Stored host is gone or offline — fall through to the default.
+    }
+
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
-  }, [hosts, selectedHostId, sandboxSelected, managedSandboxesEnabled]);
+  }, [
+    hosts,
+    hostsLoading,
+    selectedHostId,
+    sandboxSelected,
+    managedSandboxesEnabled,
+    info,
+    prefillSettled,
+  ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
   // the working-directory field is pre-filled and the user can send in one
@@ -2080,16 +2235,17 @@ export function NewChatLandingScreen() {
 
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
-  // derived home (which can arrive a render later, hence the dep).
-  const seededHostRef = useRef<string | null>(null);
+  // derived home (which can arrive a render later, hence the dep). Holds
+  // off while a project prefill is deciding on a workspace of its own.
   useEffect(() => {
+    if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     const candidate = recent[0] ?? derivedHome;
     if (!candidate) return;
     seededHostRef.current = selectedHostId;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome]);
+  }, [selectedHostId, recent, derivedHome, prefillSettled]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2197,9 +2353,10 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — candidates for a
-  // directory conflict, fed to the runner-health poll so only *connected*
-  // agents count (same /health signal as the sidebar dots).
+  // Sessions on the selected host that have a workspace — the narrow set
+  // the health poll needs to check for live directory conflicts. Much
+  // smaller than all 200 directorySessions (only host-matched + workspace
+  // rows), so registering them into the /health poll is cheap.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -2223,7 +2380,11 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const { data: hostWorktrees } = useHostWorktrees(
+  const {
+    data: hostWorktrees,
+    isPlaceholderData: hostWorktreesArePlaceholder,
+    isError: hostWorktreesFailed,
+  } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -2267,6 +2428,22 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // Auto-fill the base branch from the configured default (Settings › Git) when
+  // a new-worktree branch is named, but only until the user touches the base
+  // field — then their choice (including a cleared field) stands. Clearing the
+  // branch name (so the base field goes away) re-arms the auto-fill, so naming
+  // a branch again starts fresh from the current default.
+  useEffect(() => {
+    if (!shouldCreateWorktree) {
+      // No base field shown: reset so the next named branch re-seeds cleanly.
+      setBaseBranchEdited(false);
+      _setBaseBranch("");
+      return;
+    }
+    if (!baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [shouldCreateWorktree, baseBranchEdited]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
@@ -2287,6 +2464,67 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
+  // Project prefill: advance the machine one step per render as its data
+  // arrives. It steps rather than loops in one pass because the "branch"
+  // phase needs `hostWorktrees` for the workspace the "workspace" phase
+  // just wrote, and that listing only reflects the seeded repo one render
+  // after the write applies.
+  useEffect(() => {
+    if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    const step = projectPrefillStep(prefill, {
+      newest: projectNewest,
+      newestFailed: projectNewestFailed,
+      hosts,
+      // The pickable list, not the raw one — a hidden agent's id would seed
+      // a pick that effectiveAgentId rejects. Raw undefined = still loading.
+      agents: agents === undefined ? undefined : agentList,
+      sandboxSelected,
+      selectedHostId,
+      lastAgentId: readLastAgentId(),
+      sourceWorktrees: projectSourceWorktrees,
+      sourceWorktreesFailed: projectSourceWorktreesFailed,
+      workspaceTrimmed,
+      branchName,
+      prefilledBranch,
+      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
+      hostWorktreesFailed,
+    });
+    if (step === null) return;
+    const { writes } = step;
+    if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
+    if (writes.agentId !== undefined) {
+      setPickedAgentId((cur) => cur ?? writes.agentId!);
+      if (pickedAgentId === null) setPickedHarness(readLastHarness(writes.agentId));
+    }
+    if (writes.workspace !== undefined) {
+      setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
+    }
+    if (writes.branch !== undefined && prefilledBranch === "") {
+      // Functional fill-empty-only, like the other slots: a branch typed
+      // between the qualifying render and this effect must not be clobbered.
+      setBranchName((cur) => (cur === "" ? writes.branch! : cur));
+    }
+    setPrefill(step.state);
+  }, [
+    prefill,
+    projectParam,
+    projectNewest,
+    projectNewestFailed,
+    hosts,
+    agents,
+    agentList,
+    sandboxSelected,
+    selectedHostId,
+    projectSourceWorktrees,
+    projectSourceWorktreesFailed,
+    workspaceTrimmed,
+    branchName,
+    prefilledBranch,
+    hostWorktrees,
+    hostWorktreesArePlaceholder,
+    hostWorktreesFailed,
+    pickedAgentId,
+  ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -2512,6 +2750,10 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    // Persist the explicit pick even when it matches the current selection, so
+    // clicking the auto-selected host still records it as the sticky default
+    // for the next visit.
+    writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -2528,6 +2770,10 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox() {
+    // Persist the explicit sandbox pick (as the reserved sentinel) even when
+    // it's already selected, mirroring selectHost — so the sandbox becomes the
+    // sticky default for the next visit.
+    writeLastHostChoice(SANDBOX_HOST_CHOICE);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -2594,9 +2840,14 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+          // Create a new worktree, bind an existing one (records the branch
+          // for the sidebar + delete flow without creating anything), or
+          // neither — mirrored on the `git` block.
           const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : undefined;
+            : startInExistingWorktree
+              ? { branchName: trimmedBranch, existingWorktree: true }
+              : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
         }
         // Clear pending agent after successful creation.
@@ -2616,9 +2867,14 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither.
                   git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : undefined,
+                    : startInExistingWorktree
+                      ? { branch_name: trimmedBranch, existing_worktree: true }
+                      : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and
@@ -2679,6 +2935,9 @@ export function NewChatLandingScreen() {
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+          // The just-created session is now the project's newest; without this
+          // a pencil click within staleTime prefills from the previous one.
+          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }
@@ -3199,6 +3458,7 @@ export function NewChatLandingScreen() {
                     <DropdownMenuItem
                       key={host.host_id}
                       onSelect={() => selectHost(host.host_id)}
+                      data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >

@@ -89,6 +89,12 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalReadTool,
     SysTerminalSendTool,
 )
+from omnigent.tools.builtins.timer import (
+    # Shared with the in-process sys_timer_set tool so the runner's firing
+    # loop validates the same argument shape and delay ceiling the LLM-facing
+    # schema advertises.
+    validate_timer_set_args,
+)
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 
@@ -255,6 +261,12 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# Hindsight long-term memory builtins. Runner-local (like web_search) so that a
+# wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
+# spec-configured Hindsight tool via its ``invoke``. Without this entry the call
+# falls through to the harness, which has no such tool, and silently no-ops.
+_HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
+
 # Priority 5f.2: sys_list_models — runner-local because provider resolution
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
@@ -305,6 +317,37 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Priority 5m: Embedded-browser tools.
+# Runner dispatch POSTs a blocking action request to the server, which parks a
+# Future + publishes ``browser.action_request`` on the session stream; the
+# Omnigent desktop renderer claims and executes the action, then POSTs the
+# result back. Execution lives HERE (not in Tool.invoke) because the browser
+# protocol needs the runner's ``server_client`` and ``ToolContext`` carries
+# none. See omnigent/tools/builtins/browser.py for the schema-only classes.
+_BROWSER_TOOLS = frozenset(
+    {
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
+    }
+)
+
+# Runner-side outer HTTP read timeout for a browser action POST. The read
+# budget (60s) MUST exceed the server-side browser-action await (30s) so the
+# runner never severs the still-open POST before the server returns either the
+# action result JSON or the clean timeout-error JSON. Fast connect (30s) so an
+# unreachable server still fails promptly.
+_BROWSER_ACTION_TIMEOUT = httpx.Timeout(60.0, connect=30.0)
+
+# Returned as the tool output (HTTP 200 body, not an exception) when the server
+# browser-action await elapses with no renderer result — a clear
+# "is the session open?" message so the LLM gets a clean, actionable error.
+_BROWSER_TIMEOUT_ERROR = (
+    '{"error": "browser action timed out — is the session open in the Omnigent desktop app?"}'
+)
+
 # Builtin tools the claude-native / codex-native relay advertises to the
 # real CLI, beyond the always-relayed ``sys_os_*`` family. Native harnesses
 # ignore the harness ``tools`` list, so the relay is their ONLY tool
@@ -332,6 +375,16 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _AGENT_TOOLS
     | _POLICY_TOOLS
     | _TERMINAL_TOOLS
+    # ``browser_*`` must ride the native relay: the Omnigent desktop app
+    # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
+    # and see ONLY this relay surface — without this union member the
+    # feature is dead for its real target. The relay still filters
+    # ``ToolManager(spec).get_tool_schemas()``, so browser schemas appear
+    # only when the spec declares the builtins (see builtins/__init__.py).
+    | _BROWSER_TOOLS
+    # Memory builtins are relayed to native harnesses too — unlike web_search,
+    # native harnesses have no built-in long-term memory of their own.
+    | _HINDSIGHT_TOOLS
 )
 
 
@@ -462,6 +515,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _SKILL_TOOLS
@@ -812,6 +866,8 @@ async def _list_child_sessions(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     limit: int = 100,
+    tool: str | None = None,
+    session_name: str | None = None,
 ) -> list[dict[str, Any]] | str:
     """
     Fetch child-session summaries for a parent session.
@@ -819,11 +875,19 @@ async def _list_child_sessions(
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
     :param limit: Maximum child rows to request, e.g. ``100``.
+    :param tool: When set alongside ``session_name``, filter to
+        children whose title is ``"{tool}:{session_name}"``
+        server-side.
+    :param session_name: See ``tool``.
     :returns: List of child summary dicts, or an error string.
     """
+    params: dict[str, Any] = {"limit": limit, "order": "desc"}
+    if tool and session_name:
+        params["tool"] = tool
+        params["session_name"] = session_name
     resp = await server_client.get(
         f"/v1/sessions/{conversation_id}/child_sessions",
-        params={"limit": limit, "order": "desc"},
+        params=params,
         timeout=30.0,
     )
     if resp.status_code >= 400:
@@ -849,9 +913,7 @@ async def _find_existing_child_session(
     pair continue the existing child. The runner must therefore look
     up the row before trying to create a new one; otherwise the
     server's unique child-title constraint turns a continuation into
-    a duplicate-create failure. This currently fetches up to 1000
-    children and scans locally because the child-session endpoint does
-    not provide a ``(tool, session_name)`` filter yet.
+    a duplicate-create failure.
 
     :param server_client: Omnigent server client.
     :param conversation_id: Parent session id, e.g. ``"conv_parent123"``.
@@ -863,16 +925,16 @@ async def _find_existing_child_session(
     children = await _list_child_sessions(
         server_client=server_client,
         conversation_id=conversation_id,
-        limit=1000,
+        limit=1,
+        tool=agent,
+        session_name=title,
     )
     if isinstance(children, str):
         return children
     for child in children:
         if is_session_closed(child.get("labels"), child.get("title")):
             continue
-        label = _subagent_label(child)
-        if label.agent == agent and label.title == title:
-            return child
+        return child
     return None
 
 
@@ -1975,15 +2037,16 @@ def _build_session_create_body(
     conversation_id: str,
     title: Any,
     message: Any,
+    model: Any = None,
 ) -> dict[str, Any]:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title`` and ``message``
-    are included when provided; the message becomes the child's first
-    queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``, and
+    ``model`` are included when provided; the message becomes the child's
+    first queued user turn via ``initial_items``.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -1991,6 +2054,8 @@ def _build_session_create_body(
         string.
     :param message: Optional first user message; included only when a
         non-empty string.
+    :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
+        written as ``model_override`` on the session.
     :returns: The JSON request body.
     """
     body: dict[str, Any] = {
@@ -1999,6 +2064,8 @@ def _build_session_create_body(
     }
     if isinstance(title, str) and title:
         body["title"] = title
+    if isinstance(model, str) and model:
+        body["model_override"] = model
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2144,7 +2211,11 @@ async def _execute_session_create(
             runner_workspace=runner_workspace,
         )
     body = _build_session_create_body(
-        str(agent_id), conversation_id, args.get("title"), args.get("message")
+        str(agent_id),
+        conversation_id,
+        args.get("title"),
+        args.get("message"),
+        model=args.get("model"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2550,6 +2621,68 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
+    """
+    Return a Hindsight builtin's config dict from the parent spec.
+
+    Mirrors ``ToolManager._register_builtin_tools``: scans ``spec.tools.builtins``
+    for the entry named *tool_name* (e.g. ``"hindsight_recall"``) and returns its
+    ``config`` (api_key, bank_id, etc.). Empty dict when declared bare or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :param tool_name: The Hindsight tool name to look up.
+    :returns: The builtin's config dict.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == tool_name:
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_hindsight_tool(
+    args: dict[str, Any],
+    *,
+    tool_name: str,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a Hindsight memory tool call (retain / recall / reflect).
+
+    Builds the tool from the spec's builtin config and runs its synchronous
+    ``invoke`` off the event loop (it makes a blocking HTTP call to Hindsight).
+    The bank is resolved inside the tool from ``config.bank_id`` → ``ctx.agent_id``
+    → ``ctx.conversation_id``, so the real ``agent_id`` is threaded through here.
+
+    :param args: Parsed LLM arguments (``content`` for retain, ``query`` otherwise).
+    :param tool_name: The Hindsight tool name being dispatched.
+    :param agent_spec: Parent agent's spec; carries the Hindsight builtin config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id — the default memory bank.
+    :returns: The tool's string result, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins import get_builtin_tool
+
+    config = _hindsight_config_from_spec(agent_spec, tool_name)
+    tool = get_builtin_tool(tool_name, config)
+    if tool is None:
+        return f"Hindsight tool {tool_name!r} is not available."
+    ctx = ToolContext(
+        task_id=task_id or tool_name,
+        agent_id=agent_id or tool_name,
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _has_subagent(
     sub_agent_name: str,
     agent_spec: Any | None,
@@ -2581,8 +2714,9 @@ def _has_subagent(
 
 
 # ── Timer dispatch (RUNNER_TIMER_DISPATCH.md) ─────────────────
-
-_MAX_TIMER_SECONDS = 1_000_000.0
+# Argument validation and the delay ceiling live in the timer builtin
+# (``validate_timer_set_args``) so this firing path and the LLM-facing
+# schema stay in lockstep.
 
 
 async def _execute_timer_set(
@@ -2603,20 +2737,10 @@ async def _execute_timer_set(
     """
     from omnigent.runner import app as _app
 
-    seconds_raw = args.get("seconds")
-    if not isinstance(seconds_raw, (int, float)) or isinstance(seconds_raw, bool):
-        return json.dumps({"error": "seconds must be a number"})
-    seconds = float(seconds_raw)
-    if seconds < 0:
-        return json.dumps({"error": "seconds must be non-negative"})
-    if seconds > _MAX_TIMER_SECONDS:
-        return json.dumps({"error": f"seconds must be <= {_MAX_TIMER_SECONDS}"})
-    repeat = args.get("repeat", False)
-    if not isinstance(repeat, bool):
-        return json.dumps({"error": "repeat must be a boolean"})
-    note: str | None = args.get("note")
-    if note is not None and not isinstance(note, str):
-        return json.dumps({"error": "note must be a string"})
+    validated = validate_timer_set_args(args)
+    if isinstance(validated, str):
+        return json.dumps({"error": validated})
+    seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
 
@@ -2672,7 +2796,7 @@ async def _timer_loop(
             if note:
                 text += f"\nnote: {note!r}"
             try:
-                await server_client.post(
+                resp = await server_client.post(
                     f"/v1/sessions/{conversation_id}/events",
                     json={
                         "type": "message",
@@ -2684,6 +2808,9 @@ async def _timer_loop(
                     },
                     timeout=30.0,
                 )
+                # httpx does not raise on 4xx/5xx by default; treat those
+                # as delivery failures so they share the warning path below.
+                resp.raise_for_status()
             except (httpx.HTTPError, asyncio.TimeoutError):
                 _logger.warning(
                     "Timer %s firing persist failed for %s",
@@ -2800,6 +2927,66 @@ async def _execute_comment_tool(
         return json.dumps({"comment": resp.json()})
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"update_comment failed: {exc}"})
+
+
+async def _execute_browser_tool(
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """
+    Runner-local handler for the ``browser_*`` embedded-browser tools.
+
+    Does the blocking round-trip that drives the Omnigent desktop app's
+    embedded browser: POST ``/v1/sessions/{conversation_id}/browser/
+    action_request`` with ``{action, args}`` (where ``action`` is the
+    tool name minus the ``browser_`` prefix) and return the server's JSON
+    response verbatim as the tool output. The server parks a Future,
+    publishes ``browser.action_request`` on the session stream, and
+    resolves the Future when the winning renderer POSTs the action
+    result — so this POST stays open until the action completes or the
+    server's 30s browser-action await elapses.
+
+    Mirrors the ask-gate ``server_client.post`` pattern in
+    ``_execute_subagent_tool`` (with a much shorter read budget — see
+    ``_BROWSER_ACTION_TIMEOUT``). On the runner-side read timeout
+    (should not fire before the server returns its own clean timeout JSON,
+    since read(60) > server await(30)), returns the same timeout-error JSON
+    so the LLM always sees a clean tool error rather than an exception.
+
+    :param tool_name: The browser tool name, e.g. ``"browser_navigate"``.
+    :param args: Parsed tool arguments from the LLM, e.g.
+        ``{"url": "https://example.com"}``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Current session id, e.g. ``"conv_abc123"``.
+    :returns: The server action-result JSON string, or a timeout/error JSON.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session id"})
+
+    # Strip the ``browser_`` prefix so the wire ``action`` matches the
+    # frozen contract (navigate / snapshot / click / type / screenshot).
+    action = tool_name[len("browser_") :]
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/browser/action_request",
+            json={"action": action, "args": args},
+            timeout=_BROWSER_ACTION_TIMEOUT,
+        )
+    except httpx.ReadTimeout:
+        # The server should return its own clean timeout JSON well before this
+        # fires (read(60) > server await(30)); this is the belt-and-suspenders
+        # path if the server itself stalls.
+        return _BROWSER_TIMEOUT_ERROR
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"{tool_name} failed: {type(exc).__name__}: {exc}"})
+    if resp.status_code >= 400:
+        return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
+    return resp.text
 
 
 async def _execute_policy_tool(
@@ -4372,6 +4559,15 @@ async def execute_tool(
                 task_id=task_id,
                 agent_id=agent_id,
             )
+        elif tool_name in _HINDSIGHT_TOOLS:
+            output = await _execute_hindsight_tool(
+                args,
+                tool_name=tool_name,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
         elif tool_name in _TIMER_TOOLS:
             if tool_name == "sys_timer_set":
                 output = await _execute_timer_set(
@@ -4420,6 +4616,13 @@ async def execute_tool(
                 arguments,
                 conversation_id=conversation_id,
                 server_client=server_client,
+            )
+        elif tool_name in _BROWSER_TOOLS:
+            output = await _execute_browser_tool(
+                tool_name,
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif _is_spec_local_python_tool(tool_name, agent_spec):
             output = await _execute_local_python_tool(
@@ -5845,7 +6048,7 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
             )
-            done, _pending = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 [
                     asyncio.ensure_future(exec_coro),
                     asyncio.ensure_future(cancel_event.wait()),
@@ -5853,6 +6056,11 @@ def _spawn_async_tool(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancel_event.is_set():
+                # Drop the losing future (the tool coro). This cancels the
+                # task/coroutine but cannot interrupt an underlying
+                # asyncio.to_thread, so that thread may run to completion.
+                for fut in pending:
+                    fut.cancel()
                 session_inbox.put_nowait(
                     {
                         "handle_id": handle_id,
@@ -5862,6 +6070,10 @@ def _spawn_async_tool(
                     }
                 )
                 return ""
+            # Drop the losing future (cancel_event.wait()) so it doesn't
+            # linger as a pending task for the life of the session.
+            for fut in pending:
+                fut.cancel()
             result = next(iter(done)).result()
             session_inbox.put_nowait(
                 {

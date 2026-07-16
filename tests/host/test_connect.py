@@ -31,6 +31,8 @@ from omnigent.host.frames import (
     HostListDirFrame,
     HostListDirResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -397,6 +399,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
         request_id="req_log",
         binding_token="tok_log",
         workspace=str(workspace),
+        session_id="conv_log",
     )
 
     original_popen = subprocess.Popen
@@ -418,14 +421,15 @@ async def test_handle_launch_prints_exact_runner_log_path(
         result = await host._handle_launch(frame)
 
     assert result.status == "launched", result.error
-    # Exactly one runner-*.log was created under the host-runner dir.
-    runner_log_dir = tmp_path / ".omnigent" / "logs" / "host-runner"
+    # Exactly one runner-*.log was created under the runner log dir.
+    runner_log_dir = tmp_path / ".omnigent" / "logs" / "runner"
     log_files = list(runner_log_dir.glob("runner-*.log"))
     assert len(log_files) == 1
     out = capsys.readouterr().out
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/host-runner/{log_files[0].name}" in out
+    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
+    assert "session: conv_log" in out
 
     _cleanup_host(host)
 
@@ -513,7 +517,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # The exit code identifies the failure class without log-reading.
     assert "code 7" in error
     # The log path lets the user fetch the full log on the host.
-    assert "~/.omnigent/logs/host-runner/runner-" in error
+    assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
 
@@ -742,6 +746,77 @@ def test_handle_stop_unknown_runner() -> None:
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+
+
+def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``alive`` for a tracked
+    runner whose process is still running.
+
+    This is the still-booting / still-serving case: the server must wait
+    for this runner's tunnel rather than relaunch a healthy process.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        host._runners["runner_live"] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner-live.log"
+        )
+        result = host._handle_runner_status(
+            HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
+        )
+        assert isinstance(result, HostRunnerStatusResultFrame)
+        assert result.request_id == "req_rs"
+        assert result.status == "alive"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``dead`` for a tracked
+    runner whose process has exited.
+
+    A tracked-but-exited runner will never connect its tunnel, so the
+    server must relaunch immediately instead of burning the connect
+    grace on it.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure the process has exited before we query
+    host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "dead"
+
+
+def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``unknown`` for a runner
+    this host has no record of.
+
+    Covers a runner that was stopped (``_handle_stop`` popped it) and a
+    fresh post-restart host that never spawned it — the exact
+    host-restart case that used to strand the server on a full connect
+    grace. Both must read ``unknown`` so the server relaunches at once.
+    """
+    host = _make_host_process()
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "unknown"
 
 
 def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
@@ -1224,6 +1299,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
         "DATABRICKS_CONFIG_FILE": "/tmp/databrickscfg",
+        "DATABRICKS_AUTH_STORAGE": "plaintext",
         "ANTHROPIC_API_KEY": "sk-harness",
         "IS_SANDBOX": "1",
         "DATABRICKS_TOKEN": "dapi-secret",
@@ -1232,6 +1308,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "OMNIGENT_LOG_LEVEL": "DEBUG",
+        "OMNIGENT_LOG_TO_STDERR": "1",
+        "OMNIGENT_LOG_TTY_FD": "9",
     }
 
     env = _build_runner_env(
@@ -1252,6 +1332,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
     assert env["DATABRICKS_CONFIG_FILE"] == "/tmp/databrickscfg"
+    # The token-storage backend selector forwards too — without it the runner
+    # falls back to the ~/.databrickscfg default and can read a different token
+    # store than the host/daemon, failing to mint a token (runner tunnel 401).
+    assert env["DATABRICKS_AUTH_STORAGE"] == "plaintext"
     # Harness credentials forward — they exist FOR the runner's
     # harnesses (laptop: exported keys; managed sandbox: the
     # deployment's injected provider secrets).
@@ -1271,6 +1355,17 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # Opaque request-routing headers forward host→runner so the runner's tunnel
+    # and server callbacks reach the same server instance the host registered on
+    # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
+    assert (
+        env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
+    )
+    # Process logging controls forward so host-spawned runners honor --debug
+    # and --log-to-stderr.
+    assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
+    assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
+    assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1298,6 +1393,7 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
         "OPENAI_API_KEY": "sk-o",
@@ -1305,6 +1401,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "GEMINI_API_KEY": "g-key",
         "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
         "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        # An unrelated secret must never ride the credential set.
+        "MY_UNRELATED_SECRET": "leak-me-not",
     }
 
     env = _build_runner_env(
@@ -1319,6 +1417,10 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # The gateway model pin travels with the key/endpoint — without it a
+        # LiteLLM-style gateway session launches Claude Code model-less and
+        # the gateway rejects Claude Code's own default model.
+        "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -1335,6 +1437,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    # A secret not on the credential set / allowlist is not forwarded.
+    assert "MY_UNRELATED_SECRET" not in env
 
 
 def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
@@ -2349,4 +2453,5 @@ def test_run_host_process_announces_session_log_dir_on_start(
     )
 
     out = capsys.readouterr().out
-    assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+    assert "Session logs: ~/.omnigent/logs/runner/" in out
+    assert "This host's log: ~/.omnigent/logs/host/host-" in out

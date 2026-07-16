@@ -26,6 +26,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
+_REGISTERED_HANDLER = "omnigent.policies.builtins.safety.ask_on_os_tools"
+
 
 @pytest.fixture()
 def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
@@ -58,9 +60,9 @@ async def policy_client(
 def _policy_payload(**overrides: object) -> dict:
     """Build a valid CreateDefaultPolicyRequest payload."""
     base: dict = {
-        "name": "test_url_policy",
-        "type": "url",
-        "handler": "https://example.com/policies/eval",
+        "name": "test_policy",
+        "type": "python",
+        "handler": _REGISTERED_HANDLER,
     }
     base.update(overrides)  # type: ignore[arg-type]
     return base
@@ -70,16 +72,29 @@ def _policy_payload(**overrides: object) -> dict:
 
 
 async def test_create_default_policy(policy_client: httpx.AsyncClient) -> None:
-    """Creating a default URL policy returns the policy object."""
+    """Creating a default python policy returns the policy object."""
     resp = await policy_client.post("/v1/policies", json=_policy_payload())
     assert resp.status_code == 200
     body = resp.json()
-    assert body["name"] == "test_url_policy"
-    assert body["type"] == "url"
-    assert body["handler"] == "https://example.com/policies/eval"
+    assert body["name"] == "test_policy"
+    assert body["type"] == "python"
+    assert body["handler"] == _REGISTERED_HANDLER
     assert body["object"] == "default_policy"
     assert body["enabled"] is True
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
+
+
+async def test_create_url_policy_rejected(policy_client: httpx.AsyncClient) -> None:
+    """Creating a default policy with type='url' is rejected with 400."""
+    resp = await policy_client.post(
+        "/v1/policies",
+        json=_policy_payload(
+            name="url_policy",
+            type="url",
+            handler="https://example.com/policies/eval",
+        ),
+    )
+    assert resp.status_code == 400
 
 
 async def test_create_duplicate_policy_name(policy_client: httpx.AsyncClient) -> None:
@@ -140,7 +155,7 @@ async def test_get_default_policy(policy_client: httpx.AsyncClient) -> None:
 
 async def test_get_default_policy_not_found(policy_client: httpx.AsyncClient) -> None:
     """Getting a nonexistent policy returns 404."""
-    resp = await policy_client.get("/v1/policies/pol_nonexistent")
+    resp = await policy_client.get("/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 404
 
 
@@ -163,7 +178,7 @@ async def test_update_default_policy(policy_client: httpx.AsyncClient) -> None:
 async def test_update_default_policy_not_found(policy_client: httpx.AsyncClient) -> None:
     """Patching a nonexistent policy returns 404."""
     resp = await policy_client.patch(
-        "/v1/policies/pol_nonexistent",
+        "/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df",
         json={"name": "renamed"},
     )
     assert resp.status_code == 404
@@ -198,6 +213,6 @@ async def test_delete_default_policy(policy_client: httpx.AsyncClient) -> None:
 
 async def test_delete_default_policy_idempotent(policy_client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent policy still returns deleted: true."""
-    resp = await policy_client.delete("/v1/policies/pol_nonexistent")
+    resp = await policy_client.delete("/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
