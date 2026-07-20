@@ -2503,10 +2503,7 @@ def create_app(
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
-        async def _on_host_connect(_host_id: str, owner: str | None) -> None:
-            announce_hosts_changed(owner)
-
-        async def _on_host_disconnect(_host_id: str, owner: str | None) -> None:
+        async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
 
         app.include_router(
@@ -2516,8 +2513,9 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_host_connect,
-                on_host_disconnect=_on_host_disconnect,
+                on_host_connect=_on_hosts_changed,
+                on_host_disconnect=_on_hosts_changed,
+                on_host_update=_on_hosts_changed,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -2596,6 +2594,31 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
+
+        # Device Authorization Grant (RFC 8628): opt-in, default-off via
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
+        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
+        # these routes. Wires the revocation lookup into the auth provider so
+        # revoking a grant immediately rejects its delegated access tokens.
+        # See designs/DEVICE_AUTH.md.
+        from omnigent.server.auth import env_var_is_truthy
+
+        if (
+            env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+            and isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            and permission_store is not None
+        ):
+            from omnigent.server.device_grant_store import DeviceGrantStore
+            from omnigent.server.routes.device_auth import create_device_auth_router
+
+            device_grant_store = DeviceGrantStore(permission_store.storage_location)
+            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            app.include_router(
+                create_device_auth_router(auth_provider, device_grant_store),
+                tags=["oauth"],
+            )
+            _logger.info("device-grant: /oauth/* routes enabled")
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
